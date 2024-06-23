@@ -2,15 +2,24 @@ package main
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"log/slog"
+	"math/big"
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -28,6 +37,8 @@ func main() {
 	http.HandleFunc("/openid-connect/auth", GetAuth)
 	http.HandleFunc("POST /openid-connect/token", PostToken)
 	http.HandleFunc("POST /openid-connect/introspect", PostIntrospect)
+	http.HandleFunc("GET /openid-connect/jwks", GetJWKs)
+	http.HandleFunc("GET /openid-connect/.well-known/openid-configurations", GetConfiguration)
 
 	log.Fatal(http.ListenAndServe(":3000", nil))
 }
@@ -155,7 +166,7 @@ func PostToken(w http.ResponseWriter, r *http.Request) {
 		TokenType   string `json:"token_type"`
 		ExpiresIn   int    `json:"expires_in"`
 	}{
-		IDToken:     "dummy-id-token", // TODO: generate JWT
+		IDToken:     generateJWT("http://localhost:3000", "tiny-client", time.Hour*24),
 		AccessToken: accessToken.Token,
 		TokenType:   "Bearer",
 		ExpiresIn:   86400,
@@ -181,6 +192,66 @@ func PostIntrospect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Write([]byte(`{"active":true}`))
+}
+
+func GetJWKs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	jwk := generateJWK()
+	jwk.Kid = "2024-06-23"
+	jwk.Alg = "RS256"
+	jwk.Use = "sig"
+
+	if jwk.Kty == "" {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"failed to generate jwk"}`))
+		return
+	}
+
+	jwkSet := JWKSet{
+		Keys: []JWK{*jwk},
+	}
+	b, err := json.Marshal(jwkSet)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	w.Write(b)
+}
+
+func GetConfiguration(w http.ResponseWriter, r *http.Request) {
+	res := struct {
+		Issuer                            string   `json:"issuer"`
+		AuthorizationEndpoint             string   `json:"authorization_endpoint"`
+		TokenEndpoint                     string   `json:"token_endpoint"`
+		JWKsURI                           string   `json:"jwks_uri"`
+		ResponseTypesSupported            []string `json:"response_types_supported"`
+		SubjectTypesSupported             []string `json:"subject_types_supported"`
+		IDTokenSigningAlgValuesSupported  []string `json:"id_token_signing_alg_values_supported"`
+		ScopesSupported                   []string `json:"scopes_supported"`
+		TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported"`
+		ClaimsSupported                   []string `json:"claims_supported"`
+	}{
+		Issuer:                            "http://localhost:3000/openid-connect",
+		AuthorizationEndpoint:             "http://localhost:3000/openid-connect/auth",
+		TokenEndpoint:                     "http://localhost:3000/openid-connect/token",
+		JWKsURI:                           "http://localhost:3000/openid-connect/jwks",
+		ResponseTypesSupported:            []string{"code"},
+		SubjectTypesSupported:             []string{"public"},
+		IDTokenSigningAlgValuesSupported:  []string{"RS256"},
+		ScopesSupported:                   []string{"openid"},
+		TokenEndpointAuthMethodsSupported: []string{"client_secret_post"},
+		ClaimsSupported:                   []string{"sub", "iss"},
+	}
+
+	b, err := json.Marshal(res)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
 }
 
 /// validation
@@ -432,6 +503,94 @@ var ( // DB
 	clients      []Client
 )
 
+/// JWT
+
+type JWTPayload struct {
+	Iss string `json:"iss"`
+	Sub string `json:"sub"`
+	Aud string `json:"aud"`
+	Exp int64  `json:"exp"`
+	Iat int64  `json:"iat"`
+}
+
+type JWTHeader struct {
+	Alg string `json:"alg"`
+	Typ string `json:"typ"`
+	Kid string `json:"kid"`
+}
+
+var privateKey *rsa.PrivateKey
+
+func generateJWT(iss string, aud string, exp time.Duration) string {
+	header := JWTHeader{
+		Alg: "RS256",
+		Typ: "JWT",
+		Kid: "2024-06-23",
+	}
+	hb, err := json.Marshal(header)
+	if err != nil {
+		panic(err)
+	}
+	eh := base64.RawURLEncoding.EncodeToString(hb)
+
+	now := time.Now()
+
+	payload := JWTPayload{
+		Iss: iss,
+		Sub: randStringRunes(14),
+		Aud: aud,
+		Iat: now.Unix(),
+		Exp: now.Add(exp).Unix(),
+	}
+	pb, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	ep := base64.RawURLEncoding.EncodeToString(pb)
+
+	signTarget := fmt.Sprintf("%s.%s", eh, ep)
+	signature := sign(signTarget)
+
+	return fmt.Sprintf("%s.%s", signTarget, signature)
+}
+
+func sign(target string) string {
+	dgst := sha256.Sum256([]byte(target))
+	signature, err := privateKey.Sign(nil, dgst[:], crypto.SHA256)
+	if err != nil {
+		panic(err)
+	}
+
+	return string(base64.StdEncoding.EncodeToString(signature))
+}
+
+type JWK struct {
+	Kty    string   `json:"kty,omitempty"`
+	Use    string   `json:"use,omitempty"`
+	Kid    string   `json:"kid,omitempty"`
+	KeyOps []string `json:"key_ops,omitempty"`
+	Alg    string   `json:"alg,omitempty"`
+	X5u    string   `json:"x5u,omitempty"`
+	X5c    string   `json:"x5c,omitempty"`
+	X5t    string   `json:"x5t,omitempty"`
+	N      string   `json:"n,omitempty"`
+	E      string   `json:"e,omitempty"`
+}
+
+type JWKSet struct {
+	Keys []JWK `json:"keys"`
+}
+
+var publicKey *rsa.PublicKey
+
+func generateJWK() *JWK {
+	return &JWK{
+		Kty: "RSA",
+		N:   base64.RawURLEncoding.EncodeToString(publicKey.N.Bytes()),
+		E:   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(publicKey.E)).Bytes()),
+	}
+}
+
 func init() {
 	users = append(users, User{
 		ID:       1,
@@ -443,6 +602,36 @@ func init() {
 		ClientID:     "tiny-client",
 		ClientSecret: "c1!3n753cr37",
 	})
+
+	pemPriv, err := os.Open("./tiny_idp_private.pem")
+	if err != nil {
+		panic(err)
+	}
+	privPEM, err := io.ReadAll(pemPriv)
+	if err != nil {
+		panic(err)
+	}
+	block, _ := pem.Decode(privPEM)
+	privKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		panic(err)
+	}
+	privateKey = privKey.(*rsa.PrivateKey)
+
+	pemPub, err := os.Open("./tiny_idp_public.pem")
+	if err != nil {
+		panic(err)
+	}
+	pubPEM, err := io.ReadAll(pemPub)
+	if err != nil {
+		panic(err)
+	}
+	block, _ = pem.Decode(pubPEM)
+	pubKey, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		panic(err)
+	}
+	publicKey = pubKey.(*rsa.PublicKey)
 }
 
 func serverError(w http.ResponseWriter, err error) {
