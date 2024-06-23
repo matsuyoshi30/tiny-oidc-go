@@ -27,6 +27,7 @@ func main() {
 	http.HandleFunc("POST /login", Login)
 	http.HandleFunc("/openid-connect/auth", GetAuth)
 	http.HandleFunc("POST /openid-connect/token", PostToken)
+	http.HandleFunc("POST /openid-connect/introspect", PostIntrospect)
 
 	log.Fatal(http.ListenAndServe(":3000", nil))
 }
@@ -167,6 +168,19 @@ func PostToken(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info(string(b))
 	w.Write(b)
+}
+
+func PostIntrospect(w http.ResponseWriter, r *http.Request) {
+	accessToken := r.FormValue("token")
+	foundToken := findAccessToken(accessToken)
+
+	w.Header().Set("Content-Type", "application/json")
+	if foundToken == nil || foundToken.ExpiresAt.Before(time.Now()) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"active":false}`))
+		return
+	}
+	w.Write([]byte(`{"active":true}`))
 }
 
 /// validation
@@ -374,6 +388,16 @@ func saveAccessToken(at *AccessToken) {
 		}
 	}
 	accessTokens = append(accessTokens, *at)
+}
+
+func findAccessToken(accessToken string) *AccessToken {
+	for _, ac := range accessTokens {
+		if ac.Token == accessToken {
+			return &ac
+		}
+	}
+
+	return nil
 }
 
 var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
