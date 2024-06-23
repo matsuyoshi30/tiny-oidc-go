@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,7 @@ func main() {
 	})
 	http.HandleFunc("POST /login", Login)
 	http.HandleFunc("/openid-connect/auth", GetAuth)
+	http.HandleFunc("POST /openid-connect/token", PostToken)
 
 	log.Fatal(http.ListenAndServe(":3000", nil))
 }
@@ -71,7 +73,7 @@ func GetAuth(w http.ResponseWriter, r *http.Request) {
 	scope := queries["scope"][0]
 
 	if verr := validateGetAuth(queries); verr != nil {
-		eRes := ErrorResponse{verr.AuthCodeError}
+		eRes := ACErrorResponse{verr.AuthCodeError}
 		if verr.Target == targetRedirectURI {
 			w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
 			w.Header().Set("Location", fmt.Sprintf("%s?%s", redirectURI, eRes))
@@ -114,18 +116,71 @@ func GetAuth(w http.ResponseWriter, r *http.Request) {
 	w.Write(buf.Bytes())
 }
 
+func PostToken(w http.ResponseWriter, r *http.Request) {
+	clientID := r.FormValue("client_id")
+	code := r.FormValue("code")
+
+	authCode := findAuthCode(code, clientID)
+	client := findClient(clientID)
+
+	if terr := validateToken(r, authCode, client); terr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		w.WriteHeader(http.StatusBadRequest)
+		b, err := json.Marshal(terr)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		w.Write(b)
+		return
+	}
+
+	now := time.Now()
+	authCode.UsedAt = &now
+	saveAuthCode(authCode)
+
+	accessToken := buildAccessToken(authCode.UserID)
+	saveAccessToken(accessToken)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+
+	res := struct {
+		IDToken     string `json:"id_token"`
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		ExpiresIn   int    `json:"expires_in"`
+	}{
+		IDToken:     "dummy-id-token", // TODO: generate JWT
+		AccessToken: accessToken.Token,
+		TokenType:   "Bearer",
+		ExpiresIn:   86400,
+	}
+
+	b, err := json.Marshal(res)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	slog.Info(string(b))
+	w.Write(b)
+}
+
 /// validation
 
-type ErrorResponse struct {
+type ACErrorResponse struct {
 	Error AuthCodeError
 }
 
 type AuthCodeError string
 
 const (
-	invalidRequest          AuthCodeError = "invalid_request"
-	unsupportedResponseType               = "unsupported_response_type"
-	invalidScope                          = "invalid_scope"
+	ACEInvalidRequest          AuthCodeError = "invalid_request"
+	ACEUnsupportedResponseType               = "unsupported_response_type"
+	ACEInvalidScope                          = "invalid_scope"
 )
 
 type ErrorTarget string
@@ -148,13 +203,13 @@ func validateGetAuth(queries url.Values) *validateGetAuthError {
 	clientID := queries["client_id"]
 
 	if len(redirectURI) != 1 || len(clientID) != 1 {
-		return &validateGetAuthError{invalidRequest, targetResourceOwner}
+		return &validateGetAuthError{ACEInvalidRequest, targetResourceOwner}
 	}
 	if !slices.Contains(validRedirectURIs, redirectURI[0]) {
-		return &validateGetAuthError{invalidRequest, targetResourceOwner}
+		return &validateGetAuthError{ACEInvalidRequest, targetResourceOwner}
 	}
 	if !slices.Contains(validClientIDs, clientID[0]) {
-		return &validateGetAuthError{invalidRequest, targetResourceOwner}
+		return &validateGetAuthError{ACEInvalidRequest, targetResourceOwner}
 	}
 
 	validResponseTypes := []string{"code"}
@@ -164,16 +219,68 @@ func validateGetAuth(queries url.Values) *validateGetAuthError {
 	scope := queries["scope"]
 
 	if len(responseType) != 1 {
-		return &validateGetAuthError{invalidRequest, targetRedirectURI}
+		return &validateGetAuthError{ACEInvalidRequest, targetRedirectURI}
 	}
 	if len(scope) != 1 {
-		return &validateGetAuthError{invalidRequest, targetRedirectURI}
+		return &validateGetAuthError{ACEInvalidRequest, targetRedirectURI}
 	}
 	if !slices.Contains(validResponseTypes, responseType[0]) {
-		return &validateGetAuthError{unsupportedResponseType, targetRedirectURI}
+		return &validateGetAuthError{ACEUnsupportedResponseType, targetRedirectURI}
 	}
 	if !slices.Contains(validScopes, scope[0]) {
-		return &validateGetAuthError{invalidScope, targetRedirectURI}
+		return &validateGetAuthError{ACEInvalidScope, targetRedirectURI}
+	}
+
+	return nil
+}
+
+type TErrorResponse struct {
+	Error TokenError
+}
+
+type TokenError string
+
+const (
+	TEInvalidRequest       TokenError = "invalid_request"
+	TEInvalidClient                   = "invalid_client"
+	TEInvalidGrant                    = "invalid_grant"
+	TEUnauthorizedClient              = "unauthorized_client"
+	TEUnsupportedGrantType            = "unsupported_grant_type"
+	TEInvalidScope                    = "invalid_scope"
+)
+
+func validateToken(r *http.Request, authCode *AuthCode, client *Client) *TErrorResponse {
+	if len(r.FormValue("client_id")) == 0 {
+		return &TErrorResponse{TEInvalidRequest}
+	}
+	if len(r.FormValue("code")) == 0 {
+		return &TErrorResponse{TEInvalidRequest}
+	}
+	if len(r.FormValue("grant_type")) == 0 {
+		return &TErrorResponse{TEInvalidRequest}
+	}
+	if len(r.FormValue("redirect_uri")) == 0 {
+		return &TErrorResponse{TEInvalidRequest}
+	}
+	if !strings.EqualFold("authorization_code", r.FormValue("grant_type")) {
+		return &TErrorResponse{TEUnsupportedGrantType}
+	}
+
+	if authCode == nil {
+		return &TErrorResponse{TEInvalidGrant}
+	}
+	if authCode.UsedAt != nil {
+		return &TErrorResponse{TEInvalidGrant}
+	}
+	if authCode.RedirectURI != r.FormValue("redirect_uri") {
+		return &TErrorResponse{TEInvalidGrant}
+	}
+
+	if client == nil {
+		return &TErrorResponse{TEInvalidClient}
+	}
+	if client.ClientSecret != r.FormValue("client_secret") {
+		return &TErrorResponse{TEInvalidClient}
 	}
 
 	return nil
@@ -236,6 +343,39 @@ func saveAuthCode(ac *AuthCode) {
 	authCodes = append(authCodes, *ac)
 }
 
+func findAuthCode(code string, clientID string) *AuthCode {
+	for _, ac := range authCodes {
+		if ac.Code == code && ac.ClientID == clientID && ac.ExpiresAt.After(time.Now()) {
+			return &ac
+		}
+	}
+
+	return nil
+}
+
+type AccessToken struct {
+	Token     string
+	ExpiresAt time.Time
+	UserID    int
+}
+
+func buildAccessToken(userID int) *AccessToken {
+	token := randStringRunes(28)
+	return &AccessToken{
+		Token:     token,
+		ExpiresAt: time.Now().Add(time.Hour * 24),
+	}
+}
+
+func saveAccessToken(at *AccessToken) {
+	for i, accessToken := range accessTokens {
+		if at.Token == accessToken.Token {
+			accessTokens[i] = *at
+		}
+	}
+	accessTokens = append(accessTokens, *at)
+}
+
 var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
 func randStringRunes(n int) string {
@@ -246,9 +386,26 @@ func randStringRunes(n int) string {
 	return string(b)
 }
 
+type Client struct {
+	ClientID     string
+	ClientSecret string
+}
+
+func findClient(clientID string) *Client {
+	for _, c := range clients {
+		if c.ClientID == clientID {
+			return &c
+		}
+	}
+
+	return nil
+}
+
 var ( // DB
-	users     []User
-	authCodes []AuthCode
+	users        []User
+	authCodes    []AuthCode
+	accessTokens []AccessToken
+	clients      []Client
 )
 
 func init() {
@@ -257,6 +414,10 @@ func init() {
 		Email:    "tiny-idp@example.com",
 		Password: "pass",
 		ClientID: "tiny-client",
+	})
+	clients = append(clients, Client{
+		ClientID:     "tiny-client",
+		ClientSecret: "c1!3n753cr37",
 	})
 }
 
