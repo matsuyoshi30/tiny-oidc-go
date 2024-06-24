@@ -29,7 +29,7 @@ import (
 var loginTpl string
 
 func main() {
-	http.HandleFunc("GET /$", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("Hello tiny openid provider!"))
 	})
