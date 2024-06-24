@@ -55,6 +55,7 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	clientID := queries["client_id"][0]
 	redirectURI := queries["redirect_uri"][0]
 	scope := queries["scope"][0]
+	state := queries["state"][0]
 	issuer := "http://localhost:3000"
 
 	if !login(users, email, password) {
@@ -69,7 +70,7 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	}
 	authCode := buildAuthCode(user.ID, clientID, redirectURI)
 	saveAuthCode(authCode)
-	w.Header().Set("Location", fmt.Sprintf("%s?code=%s&iss=%s&scope=%s", redirectURI, authCode.Code, issuer, scope))
+	w.Header().Set("Location", fmt.Sprintf("%s?code=%s&iss=%s&scope=%s&state=%s", redirectURI, authCode.Code, issuer, scope, state))
 	w.WriteHeader(http.StatusFound)
 }
 
@@ -83,6 +84,7 @@ func GetAuth(w http.ResponseWriter, r *http.Request) {
 	clientID := queries["client_id"][0]
 	redirectURI := queries["redirect_uri"][0]
 	scope := queries["scope"][0]
+	state := queries["state"][0]
 
 	if verr := validateGetAuth(queries); verr != nil {
 		eRes := ACErrorResponse{verr.AuthCodeError}
@@ -113,10 +115,12 @@ func GetAuth(w http.ResponseWriter, r *http.Request) {
 		ClientID    string
 		RedirectURI string
 		Scope       string
+		State       string
 	}{
 		ClientID:    clientID,
 		RedirectURI: redirectURI,
 		Scope:       scope,
+		State:       state,
 	}
 
 	var buf bytes.Buffer
@@ -286,8 +290,9 @@ func validateGetAuth(queries url.Values) *validateGetAuthError {
 
 	redirectURI := queries["redirect_uri"]
 	clientID := queries["client_id"]
+	state := queries["state"]
 
-	if len(redirectURI) != 1 || len(clientID) != 1 {
+	if len(redirectURI) != 1 || len(clientID) != 1 || len(state) != 1 {
 		return &validateGetAuthError{ACEInvalidRequest, targetResourceOwner}
 	}
 	if !slices.Contains(validRedirectURIs, redirectURI[0]) {

@@ -1,30 +1,73 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
-	"embed"
+	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"log/slog"
 	"math/big"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
 //go:embed index.html
-var index embed.FS
+var indexTpl string
 
 func main() {
-	http.Handle("/", http.FileServer(http.FS(index)))
-	http.HandleFunc("/oidc/callback", callback)
+	http.Handle("GET /{$}", UseMiddlewares(http.HandlerFunc(index), SessionMiddleware()))
+	http.Handle("/oidc/callback", UseMiddlewares(http.HandlerFunc(callback), SessionMiddleware()))
 	log.Fatal(http.ListenAndServe(":4000", nil))
+}
+
+func index(w http.ResponseWriter, r *http.Request) {
+	b := make([]byte, 16)
+	rand.Read(b)
+	state := base64.URLEncoding.EncodeToString(b)
+
+	session := r.Context().Value(ctxSessionKey).(*session)
+	session.values["state"] = state
+
+	t, err := template.New("index").Parse(indexTpl)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+
+	data := struct {
+		ClientID     string
+		RedirectURI  string
+		Scope        string
+		ResponseType string
+		State        string
+	}{
+		ClientID:     "tiny-client",
+		RedirectURI:  "http://localhost:4000/oidc/callback",
+		Scope:        "openid",
+		ResponseType: "code",
+		State:        state,
+	}
+
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, data); err != nil {
+		serverError(w, err)
+		return
+	}
+
+	w.Write(buf.Bytes())
 }
 
 func callback(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +75,15 @@ func callback(w http.ResponseWriter, r *http.Request) {
 	queries := r.URL.Query()
 	code := queries["code"][0]
 	scope := queries["scope"][0]
+	state := queries["state"][0]
+
+	session := r.Context().Value(ctxSessionKey).(*session)
+	if session.values["state"] != state {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid state}`))
+		return
+	}
 
 	form := url.Values{}
 	form.Add("code", code)
@@ -129,6 +181,110 @@ func callback(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(tokenSet)
+}
+
+/// session
+
+type session struct {
+	id      string
+	values  map[string]interface{}
+	created time.Time
+}
+
+type sessionManager struct {
+	sessions map[string]*session
+	mu       sync.Mutex
+	maxAge   time.Duration
+}
+
+func newSessionManager(maxAge time.Duration) *sessionManager {
+	return &sessionManager{
+		sessions: make(map[string]*session),
+		maxAge:   maxAge,
+	}
+}
+
+func (sm *sessionManager) createSession() *session {
+	b := make([]byte, 32)
+	rand.Read(b)
+	id := base64.URLEncoding.EncodeToString(b)
+	return &session{
+		id:      id,
+		values:  make(map[string]interface{}),
+		created: time.Now(),
+	}
+}
+
+func (sm *sessionManager) getSession(id string) *session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	session, exists := sm.sessions[id]
+	if !exists || time.Since(session.created) > sm.maxAge {
+		return nil
+	}
+	return session
+}
+
+func (sm *sessionManager) saveSession(session *session) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.sessions[session.id] = session
+}
+
+var sm = newSessionManager(30 * time.Minute)
+
+/// middleware
+
+type Middleware func(http.Handler) http.Handler
+
+type contextKey string
+
+func (c contextKey) String() string {
+	return fmt.Sprintf("context key: %s", c)
+}
+
+var ctxSessionKey = contextKey("session")
+
+func SessionMiddleware() Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var session *session
+			cookie, err := r.Cookie("session_id")
+			if err != nil || cookie.Value == "" {
+				session = sm.createSession()
+				http.SetCookie(w, &http.Cookie{
+					Name:  "session_id",
+					Value: session.id,
+					Path:  "/",
+				})
+			} else {
+				session = sm.getSession(cookie.Value)
+				if session == nil {
+					session = sm.createSession()
+					http.SetCookie(w, &http.Cookie{
+						Name:  "session_id",
+						Value: session.id,
+						Path:  "/",
+					})
+				}
+			}
+
+			ctx := r.Context()
+			ctx = context.WithValue(ctx, ctxSessionKey, session)
+			r = r.WithContext(ctx)
+
+			next.ServeHTTP(w, r)
+
+			sm.saveSession(session)
+		})
+	}
+}
+
+func UseMiddlewares(h http.Handler, middlewares ...Middleware) http.Handler {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
+	}
+	return h
 }
 
 type JWK struct {
