@@ -69,6 +69,9 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	authCode := buildAuthCode(user.ID, clientID, redirectURI)
+	if len(queries["nonce"]) == 1 {
+		authCode.setNonce(queries["nonce"][0])
+	}
 	saveAuthCode(authCode)
 	w.Header().Set("Location", fmt.Sprintf("%s?code=%s&iss=%s&scope=%s&state=%s", redirectURI, authCode.Code, issuer, scope, state))
 	w.WriteHeader(http.StatusFound)
@@ -85,6 +88,7 @@ func GetAuth(w http.ResponseWriter, r *http.Request) {
 	redirectURI := queries["redirect_uri"][0]
 	scope := queries["scope"][0]
 	state := queries["state"][0]
+	nonce := queries["nonce"][0]
 
 	if verr := validateGetAuth(queries); verr != nil {
 		eRes := ACErrorResponse{verr.AuthCodeError}
@@ -116,11 +120,13 @@ func GetAuth(w http.ResponseWriter, r *http.Request) {
 		RedirectURI string
 		Scope       string
 		State       string
+		Nonce       string
 	}{
 		ClientID:    clientID,
 		RedirectURI: redirectURI,
 		Scope:       scope,
 		State:       state,
+		Nonce:       nonce,
 	}
 
 	var buf bytes.Buffer
@@ -170,7 +176,7 @@ func PostToken(w http.ResponseWriter, r *http.Request) {
 		TokenType   string `json:"token_type"`
 		ExpiresIn   int    `json:"expires_in"`
 	}{
-		IDToken:     generateJWT("http://localhost:3000", "tiny-client", time.Hour*24),
+		IDToken:     generateJWT("http://localhost:3000", "tiny-client", time.Hour*24, authCode.Nonce),
 		AccessToken: accessToken.Token,
 		TokenType:   "Bearer",
 		ExpiresIn:   86400,
@@ -291,8 +297,9 @@ func validateGetAuth(queries url.Values) *validateGetAuthError {
 	redirectURI := queries["redirect_uri"]
 	clientID := queries["client_id"]
 	state := queries["state"]
+	nonce := queries["nonce"]
 
-	if len(redirectURI) != 1 || len(clientID) != 1 || len(state) != 1 {
+	if len(redirectURI) != 1 || len(clientID) != 1 || len(state) != 1 || len(nonce) != 1 {
 		return &validateGetAuthError{ACEInvalidRequest, targetResourceOwner}
 	}
 	if !slices.Contains(validRedirectURIs, redirectURI[0]) {
@@ -410,6 +417,11 @@ type AuthCode struct {
 	ExpiresAt   time.Time
 	UsedAt      *time.Time
 	RedirectURI string
+	Nonce       string
+}
+
+func (ac *AuthCode) setNonce(nonce string) {
+	ac.Nonce = nonce
 }
 
 func buildAuthCode(userID int, clientID string, redirectURI string) *AuthCode {
@@ -511,11 +523,12 @@ var ( // DB
 /// JWT
 
 type JWTPayload struct {
-	Iss string `json:"iss"`
-	Sub string `json:"sub"`
-	Aud string `json:"aud"`
-	Exp int64  `json:"exp"`
-	Iat int64  `json:"iat"`
+	Iss   string `json:"iss"`
+	Sub   string `json:"sub"`
+	Aud   string `json:"aud"`
+	Exp   int64  `json:"exp"`
+	Iat   int64  `json:"iat"`
+	Nonce string `json:"nonce"`
 }
 
 type JWTHeader struct {
@@ -526,7 +539,7 @@ type JWTHeader struct {
 
 var privateKey *rsa.PrivateKey
 
-func generateJWT(iss string, aud string, exp time.Duration) string {
+func generateJWT(iss string, aud string, exp time.Duration, nonce string) string {
 	header := JWTHeader{
 		Alg: "RS256",
 		Typ: "JWT",
@@ -541,11 +554,12 @@ func generateJWT(iss string, aud string, exp time.Duration) string {
 	now := time.Now()
 
 	payload := JWTPayload{
-		Iss: iss,
-		Sub: randStringRunes(14),
-		Aud: aud,
-		Iat: now.Unix(),
-		Exp: now.Add(exp).Unix(),
+		Iss:   iss,
+		Sub:   randStringRunes(14),
+		Aud:   aud,
+		Iat:   now.Unix(),
+		Exp:   now.Add(exp).Unix(),
+		Nonce: nonce,
 	}
 	pb, err := json.Marshal(payload)
 	if err != nil {

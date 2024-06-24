@@ -4,7 +4,7 @@
 </head>
 <body>
   <div><h1>tiny-idp Login</h1></div>
-  <form method="post" action="/login?client_id={{.ClientID}}&redirect_uri={{.RedirectURI}}&scope={{.Scope}}&state={{.State}}">
+  <form method="post" action="/login?client_id={{.ClientID}}&redirect_uri={{.RedirectURI}}&scope={{.Scope}}&state={{.State}}&nonce={{.Nonce}}">
     <div>
       <label for="email">Email</label>
       <input email="email" type="text" name="email" />

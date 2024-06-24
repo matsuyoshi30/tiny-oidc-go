@@ -38,8 +38,13 @@ func index(w http.ResponseWriter, r *http.Request) {
 	rand.Read(b)
 	state := base64.URLEncoding.EncodeToString(b)
 
+	nb := make([]byte, 16)
+	rand.Read(nb)
+	nonce := base64.URLEncoding.EncodeToString(nb)
+
 	session := r.Context().Value(ctxSessionKey).(*session)
 	session.values["state"] = state
+	session.values["nonce"] = nonce
 
 	t, err := template.New("index").Parse(indexTpl)
 	if err != nil {
@@ -53,12 +58,14 @@ func index(w http.ResponseWriter, r *http.Request) {
 		Scope        string
 		ResponseType string
 		State        string
+		Nonce        string
 	}{
 		ClientID:     "tiny-client",
 		RedirectURI:  "http://localhost:4000/oidc/callback",
 		Scope:        "openid",
 		ResponseType: "code",
 		State:        state,
+		Nonce:        nonce,
 	}
 
 	var buf bytes.Buffer
@@ -168,6 +175,21 @@ func callback(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"failed to validate jwk"}`))
+		return
+	}
+
+	jp, err := decodeToken(idToken)
+	if err != nil {
+		slog.Warn(err.Error())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid token"}`))
+		return
+	}
+	if jp.Nonce != session.values["nonce"] {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid nonce"}`))
 		return
 	}
 
@@ -302,6 +324,30 @@ type JWK struct {
 
 type JWKSet struct {
 	Keys []JWK `json:"keys"`
+}
+
+type JWTPayload struct {
+	Iss   string `json:"iss"`
+	Sub   string `json:"sub"`
+	Aud   string `json:"aud"`
+	Exp   int64  `json:"exp"`
+	Iat   int64  `json:"iat"`
+	Nonce string `json:"nonce"`
+}
+
+func decodeToken(token string) (*JWTPayload, error) {
+	tokens := strings.Split(token, ".")
+	jpJson, err := base64.RawURLEncoding.DecodeString(tokens[1])
+	if err != nil {
+		return nil, err
+	}
+
+	var jp JWTPayload
+	if err := json.Unmarshal([]byte(jpJson), &jp); err != nil {
+		return nil, err
+	}
+
+	return &jp, nil
 }
 
 func verifyToken(token string, jwk JWK) error {
